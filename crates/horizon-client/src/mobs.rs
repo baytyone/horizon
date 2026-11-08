@@ -815,7 +815,7 @@ pub struct Aim {
     pub feet: [f64; 3],
 }
 /// A damage source: its type, the attacking entity and where it came from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Damage {
     pub kind: DamageKind,
     pub attacker: Option<Who>,
@@ -2611,6 +2611,81 @@ impl Seen {
         self.effects.contains(&effect)
     }
 }
+/// Whether two snapshots of one entity answer a reader the same (#8158: a
+/// mob ticked ahead of the loop on a copy is kept only while every mob after
+/// it reads what it read). The villager's brain snapshot counts as the same
+/// while it is the same allocation: a villager that refreshed it hands out a
+/// new one.
+impl PartialEq for Seen {
+    fn eq(&self, other: &Self) -> bool {
+        macro_rules! same {
+            ($($f:ident),* $(,)?) => {
+                self.in_water == other.in_water
+                    $( && self.$f == other.$f )*
+            };
+        }
+        same!(
+            playing_dead,
+            last_damage,
+            id,
+            species,
+            position,
+            bounds,
+            eye_y,
+            alive,
+            baby,
+            in_love,
+            tame,
+            bred,
+            owner,
+            hostile,
+            target,
+            health,
+            variant,
+            size,
+            color,
+            job,
+            bed,
+            yaw,
+            velocity,
+            known_speed,
+            leash,
+            caravan,
+            school,
+            section,
+            delay,
+            hurt_by,
+            active_raid,
+            opened_chest,
+            passenger,
+            vehicle,
+            hitbox,
+            player_rep,
+            pushable,
+            sleeping,
+            cold_strider,
+            category,
+            potential_job,
+            meeting,
+            profession,
+            xp,
+            stats,
+            sitting,
+            silent,
+            lying,
+            ridden,
+            is_vehicle,
+            knockback_resistance,
+            effects,
+            hunted_recently,
+            hurt_recently,
+            huntable,
+            still,
+            carrying,
+        ) && self.villager.as_ref().map(std::sync::Arc::as_ptr)
+            == other.villager.as_ref().map(std::sync::Arc::as_ptr)
+    }
+}
 impl Mob {
     /// The name used by command replies: CustomName takes precedence over the type.
     pub fn command_name(&self) -> crate::text::Text {
@@ -2863,6 +2938,11 @@ pub struct PendingPushes {
 }
 impl PendingPushes {
     const LIST_MAX: usize = 64;
+    /// Whether a push waits for `id` (#8158: a mob a push waits for ticks in
+    /// order, not ahead of the loop on a copy).
+    pub fn contains(&self, id: u32) -> bool {
+        self.by_mob.contains_key(&id) || self.list.iter().any(|&(other, _)| other == id)
+    }
     pub fn push(&mut self, id: u32, v: Vec3) {
         if self.by_mob.is_empty() && self.list.len() < Self::LIST_MAX {
             self.list.push((id, v));
@@ -2928,12 +3008,25 @@ pub fn apply_mob_pushes(m: &mut Mob, pending: &mut PendingPushes) {
 /// index `from` on), at once: vanilla sets them on the other entity during
 /// the tick, before the mobs after it tick.
 pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: usize) {
+    apply_brain_events_noting(mobs, events, from, &mut |_| {});
+}
+
+/// [`apply_brain_events`] telling `noted` every mob id it wrote (#8158: a mob
+/// whose turn is still ahead gives up its copy ticked against the state
+/// before the loop once anything wrote to it).
+pub fn apply_brain_events_noting(
+    mobs: &mut [Mob],
+    events: &mut Vec<MobEvent>,
+    from: usize,
+    noted: &mut dyn FnMut(u32),
+) {
     let mut i = from;
     while i < events.len() {
         match events[i] {
             MobEvent::BreedTarget { mob, partner } => {
                 if let Some(m) = mobs.iter_mut().find(|m| m.id == mob) {
                     animal_brain::set_breed_partner(m, partner);
+                    noted(mob);
                 }
                 events.remove(i);
             }
@@ -2941,26 +3034,33 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
                 if let Some(m) = mobs.iter_mut().find(|m| m.id == mob) {
                     animal_brain::lock_gaze(m, partner);
                     villager_brain::lock_gaze_half(m, Who::Mob(partner));
+                    noted(mob);
                 }
                 events.remove(i);
             }
             MobEvent::Retreat { mob, from, at } => {
                 if let Some(m) = mobs.iter_mut().find(|m| m.id == mob) {
                     piglin::receive_retreat(m, from, at);
+                    noted(mob);
                 }
                 events.remove(i);
             }
             MobEvent::StartRiding { rider, vehicle } => {
                 riders::start_riding(mobs, rider, vehicle);
+                noted(rider);
+                noted(vehicle);
                 events.remove(i);
             }
             MobEvent::StartFollowing { fish, leader } => {
                 aquatic::start_following(mobs, fish, leader);
+                noted(fish);
+                noted(leader);
                 events.remove(i);
             }
             MobEvent::SchoolSize { leader, by } => {
                 if let Some(m) = mobs.iter_mut().find(|m| m.id == leader) {
                     m.extra.followers += by;
+                    noted(leader);
                 }
                 events.remove(i);
             }
@@ -2973,6 +3073,7 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
                     m.extra.age = 6000;
                     m.extra.in_love = 0;
                     animal_brain::forget_breed_target(m, parent);
+                    noted(partner);
                 }
                 i += 1;
             }
@@ -3013,6 +3114,7 @@ pub fn apply_brain_events(mobs: &mut [Mob], events: &mut Vec<MobEvent>, from: us
                     if !fish_silent && let Some(at) = fish_pos {
                         sound = Some(MobEvent::Sound("entity.puffer_fish.sting", at, 1.0, 1.0));
                     }
+                    noted(target);
                 }
                 events.remove(i);
                 if let Some(s) = sound {
